@@ -1,211 +1,139 @@
-##########################################
-# Step 0: Import required libraries
-##########################################
-import streamlit as st  # For web interface
-from transformers import (
-    pipeline,  # For loading pre-trained models
-    SpeechT5Processor,  # For text-to-speech processing
-    SpeechT5ForTextToSpeech,  # TTS model
-    SpeechT5HifiGan,  # Vocoder for generating audio waveforms
-    AutoModelForCausalLM,  # For text generation
-    AutoTokenizer  # For tokenizing input text
-)  # AI model components
+import streamlit as st
+from transformers import pipeline
 
-from datasets import load_dataset  # To load voice embeddings
-import torch  # For tensor computations
-import soundfile as sf  # For handling audio files
-import re  # For regular expressions in text processing
 
-##########################################
-# Initial configuration
-##########################################
-st.set_page_config(
-    page_title="Just Comment",  # Title of the web app
-    page_icon="💬",  # Icon displayed in the browser tab
-    layout="centered",  # Center the layout of the app
-    initial_sidebar_state="collapsed"  # Start with sidebar collapsed
+# ================== Model Loading ==================
+@st.cache_resource
+def load_summarization_pipeline():
+    return pipeline("summarization", model="wyiyiyiyi/results_med_dialog", tokenizer="facebook/bart-large-cnn")
+
+@st.cache_resource
+def load_diagnosis_pipeline():
+    return pipeline("text-generation", model="Qwen/Qwen2.5-0.5B-Instruct")
+
+@st.cache_resource
+def load_zero_shot_pipeline():
+    return pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+
+# ================== UI Configuration ==================
+urgency_emojis = {
+    "Highly Urgent": "🚑",
+    "Urgent": "⚠️",
+    "Moderate": "ℹ️",
+    "Non-Urgent": "😊"
+}
+
+st.set_page_config(page_title="Medical Assistant", layout="wide")
+
+# ================== Collapsible Sidebar ==================
+with st.sidebar:
+    st.title("🏥 MedAssist Pro")
+    with st.expander("ℹ️ Platform Guide", expanded=False):
+        st.markdown("""
+        **Processing Workflow**:
+        1. **Symptom Extraction**  
+           - Automatically identifies key symptoms
+        2. **Preliminary Diagnosis**  
+           - Generates initial medical assessment
+        3. **Urgency Evaluation**  
+           - Classifies case priority level
+        **Recommended Input**:  
+        > "I've had persistent chest pain and dizziness since morning"
+        """)
+    
+    st.markdown("---")
+    st.caption("v2.1 | [Report Issues](https://example.com)")
+
+# ================== Main Interface ==================
+st.title("Intelligent Medical Assistant")
+user_input = st.text_area(
+    "Describe your symptoms:",
+    value="Hi, my sister delivered a baby boy just then and was told that the pulse rate is high and the blood sugar is low. is under some kind of observation and not given to his mother. The reason they give is bcoz my sister was having sugar during pregnancy. Is it a serious problem? Will the baby be just fine. Please reply. Doctor: in pregnant mother due to diabetes sugar will be high so baby will get more sugar so it will be producing more insulin.insulin is the prime hormone for growth in infants.{yes,not growth hormone:it s only after 5 years}up to 5 years hormone:thyroxineso more insulin produced more chubby baby is.after deliveryMORE INSULIN:LESS SUGAR{BCOZ BABY IS OUT}so blood sugar lowit s not serious if baby is monitered regulated sugar regularlybut main effect will be the baby is going to be bit heavier side and most probably may get diabetes milletus in future.so advice is keep him on low glycemic index foods after 7 years",
+    height=300
 )
 
-##########################################
-# Global model loading with caching
-##########################################
-@st.cache_resource(show_spinner=False)  # Cache the models for performance
-def _load_models():
-    """Load and cache all ML models with optimized settings"""
-    return {
-        # Emotion classification pipeline
-        'emotion': pipeline(
-            "text-classification",  # Specify task type
-            model="Thea231/jhartmann_emotion_finetuning",  # Load the model
-            truncation=True  # Enable text truncation for long inputs
-        ),
-        
-        # Text generation components
-        'textgen_tokenizer': AutoTokenizer.from_pretrained(
-            "Qwen/Qwen1.5-0.5B",  # Load tokenizer
-            use_fast=True  # Enable fast tokenization
-        ),
-        'textgen_model': AutoModelForCausalLM.from_pretrained(
-            "Qwen/Qwen1.5-0.5B",  # Load text generation model
-            torch_dtype=torch.float16  # Use half-precision for faster inference
-        ),
-        
-        # Text-to-speech components
-        'tts_processor': SpeechT5Processor.from_pretrained("microsoft/speecht5_tts"),  # Load TTS processor
-        'tts_model': SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts"),  # Load TTS model
-        'tts_vocoder': SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan"),  # Load vocoder
-        
-        # Preloaded speaker embeddings
-        'speaker_embeddings': torch.tensor(
-            load_dataset("Matthijs/cmu-arctic-xvectors", split="validation")[7306]["xvector"]  # Load speaker embeddings
-        ).unsqueeze(0)  # Add an additional dimension for batch processing
-    }
+if st.button("Start Analysis", type="primary"):
+    if not user_input.strip():
+        st.error("Please enter valid symptoms")
+    else:
+        with st.spinner("Analyzing symptoms..."):
+            # ===== Step 1: Symptom Summary =====
+            with st.container():
+                st.subheader("📋 Symptom Summary")
+                try:
+                    summarizer = load_summarization_pipeline()
+                    summary = summarizer(
+                        f"Extract key symptoms: {user_input}",
+                        max_length=80,
+                        min_length=20
+                    )[0]['summary_text']
+                    st.info(f"**Identified Symptoms**: {summary}")
+                except Exception as e:
+                    st.error(f"Summary Error: {str(e)}")
 
-##########################################
-# UI Components
-##########################################
-def _display_interface():
-    """Render user interface elements"""
-    st.title("Just Comment")  # Set the main title of the app
-    st.markdown("### I'm listening to you, my friend～")  # Subheading for user interaction
-    
-    return st.text_area(
-        "📝 Enter your comment:",  # Label for the text area
-        placeholder="Type your message here...",  # Placeholder text
-        height=150,  # Height of the text area
-        key="user_input"  # Unique key for the text area
-    )
+            # ===== Step 2: Preliminary Diagnosis =====
+            with st.container():
+                st.subheader("🩺 Preliminary Diagnosis")
+                try:
+                    diagnoser = load_diagnosis_pipeline()
+                    
+                    # Qwen-specific chat format
+                    messages = [
+                        {"role": "system", "content": "You are a medical expert. Analyze symptoms and provide structured diagnosis."},
+                        {"role": "user", "content": f"""
+                         Analyze these symptoms: {summary}
+                         
+                         Required response format:
+                         1. Differential diagnosis (3 possibilities)
+                         2. Most likely condition
+                         3. Recommended next steps
+                         """}
+                    ]
+                    
+                    # Generate response
+                    diagnosis = diagnoser(
+                        messages,
+                        max_new_tokens=500,  # Qwen需要更多token
+                        temperature=0.7,
+                        top_p=0.95,
+                        do_sample=True,
+                        eos_token_id=151645,  # Qwen的特定结束符<|endoftext|>
+                        return_full_text=False
+                    )[0]['generated_text']
+                    
+                    # 结构化解析响应
+                    formatted_diagnosis = "\n".join([
+                        line for line in diagnosis.split("\n") 
+                        if line.startswith(("1.", "2.", "3."))
+                    ])
+                    
+                    st.success(f"""
+                    **Clinical Assessment**:
+                    {formatted_diagnosis}
+                    """)
+                    
+                except Exception as e:
+                    st.error(f"Diagnosis Error: {str(e)}")
 
-##########################################
-# Core Processing Functions
-##########################################
-def _analyze_emotion(text, classifier):
-    """Identify dominant emotion with confidence threshold"""
-    results = classifier(text, return_all_scores=True)[0]  # Get emotion scores
-    valid_emotions = {'sadness', 'joy', 'love', 'anger', 'fear', 'surprise'}  # Define valid emotions
-    filtered = [e for e in results if e['label'].lower() in valid_emotions]  # Filter results by valid emotions
-    return max(filtered, key=lambda x: x['score'])  # Return the emotion with the highest score
-
-def _generate_prompt(text, emotion):
-    """Create structured prompts for all emotion types"""
-    prompt_templates = {
-        "sadness": (
-            "Sadness detected: {input}\n"
-            "Required response structure:\n"
-            "1. Empathetic acknowledgment\n2. Support offer\n3. Solution proposal\n"
-            "Response:"
-        ),
-        "joy": (
-            "Joy detected: {input}\n"
-            "Required response structure:\n"
-            "1. Enthusiastic thanks\n2. Positive reinforcement\n3. Future engagement\n"
-            "Response:"
-        ),
-        "love": (
-            "Affection detected: {input}\n"
-            "Required response structure:\n"
-            "1. Warm appreciation\n2. Community focus\n3. Exclusive benefit\n"
-            "Response:"
-        ),
-        "anger": (
-            "Anger detected: {input}\n"
-            "Required response structure:\n"
-            "1. Sincere apology\n2. Action steps\n3. Compensation\n"
-            "Response:"
-        ),
-        "fear": (
-            "Concern detected: {input}\n"
-            "Required response structure:\n"
-            "1. Reassurance\n2. Safety measures\n3. Support options\n"
-            "Response:"
-        ),
-        "surprise": (
-            "Surprise detected: {input}\n"
-            "Required response structure:\n"
-            "1. Acknowledge uniqueness\n2. Creative solution\n3. Follow-up\n"
-            "Response:"
-        )
-    }
-    return prompt_templates.get(emotion.lower(), "").format(input=text)  # Format and return the appropriate prompt
-
-def _process_response(raw_text):
-    """Clean and format the generated response"""
-    # Extract text after last "Response:" marker
-    processed = raw_text.split("Response:")[-1].strip()
-    
-    # Remove incomplete sentences
-    if '.' in processed:
-        processed = processed.rsplit('.', 1)[0] + '.'  # Ensure the response ends with a period
-    
-    # Ensure length between 50-200 characters
-    return processed[:200].strip() if len(processed) > 50 else "Thank you for your feedback. We value your input and will respond shortly."
-
-def _generate_text_response(input_text, models):
-    """Generate optimized text response with timing controls"""
-    # Emotion analysis
-    emotion = _analyze_emotion(input_text, models['emotion'])  # Analyze the emotion of user input
-    
-    # Prompt engineering
-    prompt = _generate_prompt(input_text, emotion['label'])  # Generate prompt based on detected emotion
-    
-    # Text generation with optimized parameters
-    inputs = models['textgen_tokenizer'](prompt, return_tensors="pt").to('cpu')  # Tokenize the prompt
-    outputs = models['textgen_model'].generate(
-        inputs.input_ids,  # Input token IDs
-        max_new_tokens=100,  # Strict token limit for response length
-        temperature=0.7,  # Control randomness in text generation
-        top_p=0.9,  # Control diversity in sampling
-        do_sample=True,  # Enable sampling to generate varied responses
-        pad_token_id=models['textgen_tokenizer'].eos_token_id  # Use end-of-sequence token for padding
-    )
-    
-    return _process_response(
-        models['textgen_tokenizer'].decode(outputs[0], skip_special_tokens=True)  # Decode and process the response
-    )
-
-def _generate_audio_response(text, models):
-    """Convert text to speech with performance optimizations"""
-    # Process text input for TTS
-    inputs = models['tts_processor'](text=text, return_tensors="pt")  # Tokenize input text for TTS
-    
-    # Generate spectrogram
-    spectrogram = models['tts_model'].generate_speech(
-        inputs["input_ids"],  # Input token IDs for TTS
-        models['speaker_embeddings']  # Use preloaded speaker embeddings
-    )
-    
-    # Generate waveform with optimizations
-    with torch.no_grad():  # Disable gradient calculation for inference
-        waveform = models['tts_vocoder'](spectrogram)  # Generate audio waveform from spectrogram
-    
-    # Save audio file
-    sf.write("response.wav", waveform.numpy(), samplerate=16000)  # Save waveform as a WAV file
-    return "response.wav"  # Return the path to the saved audio file
-
-##########################################
-# Main Application Flow
-##########################################
-def main():
-    """Primary execution flow"""
-    # Load models once
-    ml_models = _load_models()  # Load all models and cache them
-    
-    # Display interface
-    user_input = _display_interface()  # Show the user input interface
-    
-    if user_input:  # Check if user has entered input
-        # Text generation stage
-        with st.spinner("🔍 Analyzing emotions and generating response..."):  # Show loading spinner
-            text_response = _generate_text_response(user_input, ml_models)  # Generate text response
-        
-        # Display results
-        st.subheader("📄 Generated Response")  # Subheader for response section
-        st.markdown(f"```\n{text_response}\n```")  # Display generated response in markdown format
-        
-        # Audio generation stage
-        with st.spinner("🔊 Converting to speech..."):  # Show loading spinner
-            audio_file = _generate_audio_response(text_response, ml_models)  # Generate audio response
-            st.audio(audio_file, format="audio/wav")  # Play audio file in the app
-
-if __name__ == "__main__":
-    main()  # Execute the main function when the script is run
+            # ===== Step 3: Urgency Classification =====
+            with st.container():
+                st.subheader("🚨 Urgency Evaluation")
+                try:
+                    classifier = load_zero_shot_pipeline()
+                    classification = classifier(
+                        summary,
+                        candidate_labels=list(urgency_emojis.keys())
+                    )
+                    
+                    cols = st.columns(4)
+                    for idx, (label, score) in enumerate(zip(classification["labels"], classification["scores"])):
+                        with cols[idx]:
+                            st.markdown(f"""
+                            <div style="text-align:center">
+                                <h3>{urgency_emojis[label]}</h3>
+                                <strong>{label}</strong><br>
+                                {score*100:.1f}%
+                            </div>
+                            """, unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"Classification Error: {str(e)}")
