@@ -1,4 +1,9 @@
-streamlit
 transformers
+datasets
 torch
-numpy
+evaluate
+scikit-learn
+gradio
+accelerate
+nltk
+spacy
