@@ -1,4 +1,7 @@
 streamlit
 transformers
 torch
+spaces
 Pillow
+soundfile
+sentencepiece
