@@ -1,9 +1,4 @@
-streamlit
-pandas
-torch
+gradio
 transformers
-matplotlib
-seaborn
-wordcloud
-plotly
-scikit-learn
+torch
+sentencepiece
