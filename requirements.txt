@@ -5,3 +5,4 @@ spaces
 Pillow
 soundfile
 sentencepiece
+datasets
