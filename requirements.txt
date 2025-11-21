@@ -1,8 +1,4 @@
-streamlit==1.22.0
-pandas
-plotly
-beautifulsoup4
-requests
+streamlit
 transformers
 torch
-matplotlib
+numpy
