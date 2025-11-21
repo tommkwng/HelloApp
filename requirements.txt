@@ -1,8 +1,9 @@
 streamlit
-torch
-transformers==4.31.0
 pandas
+torch
+transformers
 matplotlib
-safetensors
-sentencepiece
-huggingface-hub
+seaborn
+wordcloud
+plotly
+scikit-learn

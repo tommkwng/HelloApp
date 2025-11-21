@@ -1,217 +1,481 @@
-import os
-os.environ["HOME"] = os.getcwd()  # 解决streamlit权限问题，确保Streamlit能在当前目录下创建配置文件
-
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
+import os
 import torch
-import base64
+import time
+import re
+import ast
+from datetime import datetime
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import pipeline
+from collections import Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+from wordcloud import WordCloud
+import plotly.express as px
 
-# --------------------
-# 0. Page config & sidebar
-# --------------------
-st.set_page_config(page_title='Weibo Sentiment Analysis & Auto Report', page_icon='💡', layout='wide')
-st.sidebar.image('https://huggingface.co/front/assets/huggingface_logo-noborder.svg', width=120)
-st.sidebar.markdown('''
-**Weibo Sentiment Analysis & Auto Report System**  
-- Automatic sentiment classification
-- Sentiment distribution visualization
-- Auto-generated analysis report
-- Downloadable results
-''')
-
-# --------------------
-# 1. Load sentiment analysis model (huggingface云端模型)
-# --------------------
-@st.cache_resource
-def load_sentiment_model():
-    # 这里填写你在huggingface上模型的名字
-    model_dir = 'Erica12345612/weibo-sentiment-bert'
-    # 自动下载并加载模型和分词器
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    # 创建情感分析pipeline，自动选择GPU或CPU
-    pipe = pipeline('text-classification', model=model, tokenizer=tokenizer, device=0 if torch.cuda.is_available() else -1)
-    return pipe
-
-sentiment_pipe = load_sentiment_model()
-
-# --------------------
-# 2. Load English report generation model (gpt2, huggingface云端模型)
-# --------------------
-@st.cache_resource
-def load_report_model():
-    # 直接从huggingface云端加载gpt2模型
-    model_dir = 'gpt2'
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForCausalLM.from_pretrained(model_dir)
-    return tokenizer, model
-
-gen_tokenizer, gen_model = load_report_model()
-
-def generate_summary_keyword(statistics):
-    prompt = (
-        f"Summarize the overall user sentiment for Weibo in one short English sentence, based on these results: {statistics}"
-    )
-    input_ids = gen_tokenizer(prompt, return_tensors='pt').input_ids
-    output = gen_model.generate(
-        input_ids,
-        max_new_tokens=20,
-        pad_token_id=gen_tokenizer.eos_token_id,
-        no_repeat_ngram_size=3
-    )
-    keyword = gen_tokenizer.decode(output[0], skip_special_tokens=True).strip()
-    return keyword
-
-def generate_report(statistics):
-    keyword = generate_summary_keyword(statistics)
-    stat_dict = {}
-    for item in statistics.split(','):
-        if ':' in item:
-            k, v = item.split(':')
-            stat_dict[k.strip()] = v.strip()
-    if stat_dict:
-        main_sentiment = max(stat_dict, key=lambda k: int(stat_dict[k]))
-        main_count = stat_dict[main_sentiment]
+# 1. Sentiment Analysis Function
+@st.cache_data(show_spinner=False)
+def perform_sentiment_analysis(df, text_column="text"):
+    """
+    Perform sentiment analysis on a DataFrame column using Bertweet.
+    Args:
+        df (pd.DataFrame): Input DataFrame containing text data.
+        text_column (str): Column name containing the text to analyze.
+    Returns:
+        pd.DataFrame: DataFrame with added sentiment labels.
+    """
+    # Combine post title and selftext
+    if 'selftext' in df.columns and 'title' in df.columns:
+        df['post_text'] = df['title'].fillna('') + " " + df['selftext'].fillna('')
     else:
-        main_sentiment = 'N/A'
-        main_count = '0'
-    summary = f"The overall sentiment among Weibo users is {keyword}."
-    report = f'''
-Sentiment Analysis Report
+        df['post_text'] = df['title']
 
-Summary:
-{summary}
-The sentiment analysis of recent Weibo posts shows the following distribution: {statistics}.
-Among all posts, the most common sentiment is "{main_sentiment}" with {main_count} occurrences.
+    # Clean and standardize text
+    def clean_text(text):
+        text = str(text).lower()
+        text = re.sub(r'\s+', ' ', text)
+        text = text.strip()
+        return text
 
-Possible Reasons:
-A high proportion of 'none' sentiment may indicate that users are posting more neutral or informational content, or that the sentiment detection model needs further tuning for the Weibo context. This distribution may also be influenced by recent events, product updates, or public opinion trends. Positive sentiments such as 'like' and 'happiness' indicate user satisfaction, while 'none' or negative sentiments may reflect dissatisfaction or lack of engagement.
+    df['post_text'] = df['post_text'].apply(clean_text)
 
-Business Implications:
-Weibo can use these insights to optimize content recommendation and user engagement strategies. The company should leverage positive feedback to reinforce strengths, while paying close attention to negative or neutral sentiments to identify areas for improvement. Understanding the root causes behind these sentiments can help guide business strategy and improve platform experience.
+    # Load the finetuned model and tokenizer
+    model_name = "henryliiiiii/bertweet-finetuned-reddit"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
 
-Suggestions for Improvement:
-1. Regularly monitor sentiment trends to detect changes in user attitudes.
-2. Engage with users who express negative or neutral sentiments to gather feedback.
-3. Promote positive experiences and address common pain points.
-4. Use sentiment insights to inform product and service enhancements.
+    # Function to get sentiment scores
+    def get_sentiment(texts):
+        inputs = tokenizer(texts, return_tensors="pt", truncation=True, padding=True, max_length=128)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        sentiment_map = {0: "Negative", 1: "Neutral", 2: "Positive"}
+        return [sentiment_map[p] for p in torch.argmax(probabilities, dim=-1).tolist()]
 
-This report is generated automatically by the Weibo Sentiment Analysis & Auto Report System. It can be used for product optimization, user operations, and strategic decision support.
-'''
-    return report.strip()
+    # Apply sentiment analysis to each text entry
+    df["sentiment_label"] = df["post_text"].apply(lambda x: get_sentiment([x])[0])
+    return df
 
-# --------------------
-# 3. Download sample CSV
-# --------------------
-def get_table_download_link(df):
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()  # some strings
-    href = f'<a href="data:file/csv;base64,{b64}" download="sample_weibo.csv">Download sample CSV</a>'
-    return href
+# 2. Text Generation Pipeline for Summaries
+def get_text_generation_pipeline():
+    """
+    Returns a HuggingFace text generation pipeline using GPT2.
+    """
+    return pipeline("text-generation", model="gpt2")
 
-sample_df = pd.DataFrame({
-    'text': [
-        '今天心情特别好，阳光真美！',
-        '这个服务太差了，真让人生气。',
-        '有点失落，事情没按预期发展。',
-        '收到惊喜礼物，好开心！',
-        '没什么特别的感觉，就是普通一天。',
-        '最近压力很大，有点害怕未来。',
-        '我很喜欢这款产品，推荐！',
-        '看到这些消息真的很恶心。',
-        '客服态度非常好，点赞。',
-        '快递太慢了，失望。',
-        '绝对爱上了这个功能！',
-        '和预期不一样，有点失望。',
-        '新版本更新很棒，体验提升了。',
-        '为什么总是卡顿？',
-        '售后支持很及时，满意。',
-        '感觉被忽视了，有点难过。',
-        '这是我用过最棒的应用。',
-        '再也不会买这家东西了。',
-        '操作很方便，省心省力。',
-        '太糟糕了，体验极差。'
+def generate_nikon_summary_with_action(nikon_df, avg_score):
+    """
+    Generate a concise summary of Nikon Z30 sentiment analysis results with actionable suggestions.
+    Args:
+        nikon_df (pd.DataFrame): DataFrame filtered for Nikon posts.
+        avg_score (float): Average sentiment score.
+    Returns:
+        str: Summary (<=400 chars) with actionable suggestions.
+    """
+    pos = nikon_df["sentiment_label"].value_counts().get("Positive", 0)
+    neu = nikon_df["sentiment_label"].value_counts().get("Neutral", 0)
+    neg = nikon_df["sentiment_label"].value_counts().get("Negative", 0)
+    total = pos + neu + neg
+    if total == 0:
+        return "No Nikon Z30 posts available for summary."
+    pct_pos = pos / total * 100
+    pct_neu = neu / total * 100
+    pct_neg = neg / total * 100
+
+    summary = (
+        f"Nikon Z30 Reddit posts: {pct_pos:.0f}% positive, {pct_neu:.0f}% neutral, {pct_neg:.0f}% negative. "
+        f"Average sentiment score: {avg_score:.2f} (-1=Negative, 0=Neutral, 1=Positive). "
+    )
+    return summary[:400]
+
+def show_nikon_z30_summary_button(nikon_df, avg_score, key=None):
+    """
+    Display a button to generate a summary for Nikon Z30 posts.
+    """
+    if st.button("No time to read? Click to generate summary!", key=key):
+        with st.spinner("Generating summary..."):
+            summary = generate_nikon_summary_with_action(nikon_df, avg_score)
+        st.success(summary)
+
+def generate_brand_comparison_summary(sentiment_stats):
+    """
+    Compare sentiment analysis results for Nikon, Sony, and Canon, and generate actionable knowledge for Nikon.
+    Args:
+        sentiment_stats (dict): Dict with keys as brand names and values as dicts of sentiment counts and avg_score.
+    Returns:
+        str: Actionable summary for Nikon (<=1000 chars).
+    """
+    brands = ["nikon", "sony", "canon"]
+    lines = []
+    for brand in brands:
+        stats = sentiment_stats.get(brand, {})
+        pos = stats.get("Positive", 0)
+        neu = stats.get("Neutral", 0)
+        neg = stats.get("Negative", 0)
+        avg = stats.get("avg_score", 0)
+        total = pos + neu + neg
+        if total == 0:
+            pct_str = "No data"
+        else:
+            pct_str = f"{pos/total*100:.0f}% positive, {neu/total*100:.0f}% neutral, {neg/total*100:.0f}% negative, avg: {avg:.2f}"
+        lines.append(f"{brand.capitalize()}: {pct_str}")
+
+    # Actionable knowledge for Nikon Z30 product manager
+    actionable = [
+        "1. Highlight video and vlogging strengths in marketing.",
+        "2. Address autofocus and low-light concerns in updates or communications.",
+        "3. Expand lens options and promote third-party compatibility."
     ]
-})
 
-# --------------------
-# 4. Streamlit UI
-# --------------------
-st.markdown('<h1 style="color:#FF6F00;font-size:2.5em;">Weibo Sentiment Analysis & Auto Report</h1>', unsafe_allow_html=True)
-st.markdown('<hr style="border:1px solid #FF6F00;">', unsafe_allow_html=True)
-st.write('**Upload or input Weibo texts. The system will analyze sentiment distribution, generate visualizations, and auto-generate a brief report.**')
+    summary = (
+        "Sentiment comparison:\n" +
+        "\n".join(lines) +
+        "\n\nActionable Knowledge for Nikon Z30 Product Manager:\n" +
+        "\n".join(actionable)
+    )
+    return summary[:1000]
 
-st.markdown(get_table_download_link(sample_df), unsafe_allow_html=True)
-st.info("Please upload a CSV file with a column named 'text'. You can download a sample above.")
+def show_competitor_summary_button(filtered_df, avg_score):
+    """
+    Display a button to generate a summary comparing Nikon, Sony, and Canon.
+    """
+    sentiment_stats = {}
+    for brand in ["nikon", "sony", "canon"]:
+        brand_df = filtered_df[filtered_df["camera"].str.lower() == brand]
+        counts = brand_df["sentiment_label"].value_counts().to_dict()
+        avg = brand_df["sentiment_label"].map({"Negative": -1, "Neutral": 0, "Positive": 1}).mean()
+        sentiment_stats[brand] = {
+            "Positive": counts.get("Positive", 0),
+            "Neutral": counts.get("Neutral", 0),
+            "Negative": counts.get("Negative", 0),
+            "avg_score": avg if pd.notnull(avg) else 0
+        }
+    if st.button("No time to read? Click to generate summary!"):
+        with st.spinner("Generating summary..."):
+            summary = generate_brand_comparison_summary(sentiment_stats)
+        st.success(summary)
 
-texts = []
-input_mode = st.radio('Select input method:', ['Batch upload CSV', 'Manual input'])
+# 3. Sidebar Navigation
+def sidebar():
+    """
+    Display the sidebar with logo, navigation, and contact info.
+    """
+    st.sidebar.markdown(
+        """
+        <div style="display: flex; justify-content: center; align-items: center;">
+            <img src="https://upload.wikimedia.org/wikipedia/commons/f/f3/Nikon_Logo.svg" width="120"/>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    st.sidebar.markdown(
+        """
+        <h2 style="text-align:center;">Nikon Z30 Insight Hub</h2>
+        """,
+        unsafe_allow_html=True
+    )
+    page = st.sidebar.selectbox(
+        label="navigation",
+        options=("Nikon Z30 Insights", "Competitor Analysis"),
+        index=0, 
+        label_visibility="collapsed"
+    )
+    st.sidebar.markdown('<hr style="border:1px solid #e6e6e6;">', unsafe_allow_html=True)
+    st.sidebar.caption('Wish to connect?')
+    st.sidebar.markdown(
+        """
+        <div style="display: flex; justify-content: center; align-items: center; gap: 12px;">
+            <a href="https://www.linkedin.com/in/daisy-huang-5a37351a6/" target="_blank" title="Daisy Huang">
+                <img src="https://media.licdn.com/dms/image/v2/D4D35AQGC3-Em8xyEIw/profile-framedphoto-shrink_400_400/profile-framedphoto-shrink_400_400/0/1700539170740?e=1748246400&v=beta&t=FYGP5Tlp9LmTtP0vUYajVXE74nf9YU6clcsc-2DqpAI" width="60" style="border-radius:50%;" />
+            </a>
+            <a href="https://www.linkedin.com/in/henry-li-52051b2a5/" target="_blank" title="Henry Li">
+                <img src="https://media.licdn.com/dms/image/v2/D5635AQEWIrquMmsx5Q/profile-framedphoto-shrink_400_400/profile-framedphoto-shrink_400_400/0/1710083972342?e=1748250000&v=beta&t=RiOK-bFOtXak8Bq-qaPAcBG4n9kE59YmTCWbPLvC9Vk" width="60" style="border-radius:50%;" />
+            </a>
+        </div>
+        <div style="text-align:center;"></div>
+        """,
+        unsafe_allow_html=True
+    )
+    return page
 
-if input_mode == 'Batch upload CSV':
-    uploaded_file = st.file_uploader('Upload a CSV file with a column named "text"', type=['csv'])
-    st.write("uploaded_file:", uploaded_file)
-    if uploaded_file is not None:
-        st.success(f"File {uploaded_file.name} uploaded successfully!")
-        st.write("File name:", uploaded_file.name)
-        st.write("File type:", uploaded_file.type)
-        st.write("File size:", uploaded_file.size)
-        try:
-            df = pd.read_csv(uploaded_file)
-            st.write(df.head())
-            st.write("Columns:", df.columns.tolist())
-        except Exception as e:
-            st.error(f"Error reading file: {e}")
-        if 'text' not in df.columns:
-            st.error('CSV file must contain a column named "text"!')
-            st.stop()
-        texts = df['text'].astype(str).tolist()
-        st.write("Texts loaded:", texts[:3])
-else:
-    for i in range(5):
-        text = st.text_input(f'Input Weibo text #{i+1} (optional)')
-        if text:
-            texts.append(text)
+# 4. Nikon Z30 Insights Page
+def show_nikon_z30():
+    """
+    Display the main insights page for Nikon Z30, including sentiment metrics and summary generator.
+    """
+    st.header("🎉 Welcome to Nikon Z30 Insight Hub!")
+    st.markdown(
+        """
+        <div style="background: #fffbe6; padding: 20px 24px; border-radius: 12px; margin-bottom: 24px; border: 1px solid transparent;">
+            <span style="font-size: 1.1rem; color: #222;">
+                This is a strategic social media intelligence platform designed for Nikon to drive market success through AI-powered insights. Through tracking user comments on the key social media platform, Reddit, the hub can help Nikon:<br><br>
+                - 📊 Identify user satisfaction rate and pain points effortlessly<br>
+                - 🔍 Facilitates direct benchmarking of the Z30 against key competitors (e.g., Canon R50, Sony ZVE10)<br>
+                - 💪 Generates actionable summaries of reviews and ratings to inform quick decisions on product improvements, marketing, or warranties.<br><br>
+                <b>Simplify Insight, Amplify Impact ✨</b>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+   
+    # Load the prepared CSV file
+    try:
+        df = pd.read_csv("cleaned_all_reddit_posts.csv")
+        if "created_utc" in df.columns:
+            df["created_date"] = pd.to_datetime(df["created_utc"], unit="s", errors="coerce")
+        else:
+            df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")
+    except Exception as e:
+        st.error(f"Error reading the prepared file: {e}")
+        return
 
-if texts:
-    st.markdown('---')
-    st.subheader('1. 🎯 Sentiment Analysis Results')
-    with st.spinner('Analyzing sentiment...'):
-        results = sentiment_pipe(texts)
-    label_map = {
-        '0': 'like', '1': 'disgust', '2': 'happiness', '3': 'sadness',
-        '4': 'anger', '5': 'surprise', '6': 'fear', '7': 'none',
-        'like': 'like', 'disgust': 'disgust', 'happiness': 'happiness',
-        'sadness': 'sadness', 'anger': 'anger', 'surprise': 'surprise',
-        'fear': 'fear', 'none': 'none',
-        'LABEL_0': 'like', 'LABEL_1': 'disgust', 'LABEL_2': 'happiness', 'LABEL_3': 'sadness',
-        'LABEL_4': 'anger', 'LABEL_5': 'surprise', 'LABEL_6': 'fear', 'LABEL_7': 'none'
-    }
-    pred_labels = [label_map.get(str(r['label']), r['label']) for r in results]
-    df_result = pd.DataFrame({'Text': texts, 'Sentiment': pred_labels, 'Confidence': [round(r['score'], 3) for r in results]})
-    st.dataframe(df_result.style.background_gradient(cmap='Oranges'))
+    # Sentiment analysis with progress bar
+    with st.spinner("Performing sentiment analysis, please wait..."):
+        progress_bar = st.progress(0, text="Analyzing sentiment...")
+        total = len(df)
+        batch_size = 32
 
-    st.markdown('---')
-    st.subheader('2. 📊 Sentiment Distribution Visualization')
-    stat = df_result['Sentiment'].value_counts().sort_index()
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-    colors = plt.cm.Paired.colors
-    stat.plot.pie(autopct='%1.1f%%', ax=ax[0], title='Sentiment Distribution (Pie)', colors=colors)
-    stat.plot.bar(ax=ax[1], title='Sentiment Distribution (Bar)', color='#FF6F00')
-    ax[0].set_ylabel('')
+        def batch_sentiment(df, batch_size=32):
+            results = []
+            for i in range(0, total, batch_size):
+                batch = df.iloc[i:i+batch_size]
+                batch_result = perform_sentiment_analysis(batch, text_column="text")
+                results.append(batch_result)
+                progress_bar.progress(min((i+batch_size)/total, 1.0), text=f"Analyzing sentiment... ({min(i+batch_size, total)}/{total})")
+            progress_bar.empty()
+            return pd.concat(results, ignore_index=True)
+
+        df = batch_sentiment(df, batch_size=batch_size)
+
+    # Filter for Nikon-related posts
+    nikon_df = df[df["camera"].astype(str).str.strip().str.lower() == "nikon"].copy()
+
+    # Map sentiment_label to numeric score
+    sentiment_score_map = {"Negative": -1, "Neutral": 0, "Positive": 1}
+    nikon_df["sentiment_score"] = nikon_df["sentiment_label"].map(sentiment_score_map)
+    avg_score = nikon_df["sentiment_score"].mean()
+
+    # Show summary generator button before metrics
+    show_nikon_z30_summary_button(nikon_df, avg_score, key="summary_before_metrics")
+
+    # Metric 1: Sentiment distribution pie chart
+    st.subheader("📊 Sentiment Distribution for Z30-related Posts")
+    nikon_sentiment_counts = nikon_df["sentiment_label"].value_counts()
+    fig = px.pie(
+        nikon_sentiment_counts,
+        names=nikon_sentiment_counts.index,
+        values=nikon_sentiment_counts.values,
+        color=nikon_sentiment_counts.index,
+        color_discrete_map={
+            "Negative": "#b8b5cb",
+            "Neutral": "#fff3a3",
+            "Positive": "#ffd700"
+        }
+    )
+    st.plotly_chart(fig)
+
+    # Metric 2: Average sentiment score for Nikon posts
+    st.subheader("⭐ Average Sentiment Score for Z30-related Posts")
+    st.metric("Average Sentiment Score", f"{avg_score:.2f}", help="-1: Negative, 0: Neutral, 1: Positive")
+    import plotly.graph_objects as go
+    fig_score = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=avg_score if pd.notnull(avg_score) else 0,
+        gauge={
+            'axis': {'range': [-1, 1]},
+            'bar': {'color': "#ffe066"},
+            'steps': [
+                {'range': [-1, 0], 'color': "#fffbe6"},
+                {'range': [0, 1], 'color': "#fffde6"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': avg_score if pd.notnull(avg_score) else 0
+            }
+        },
+        title={'text': "Nikon Posts Sentiment Score"}
+    ))
+    st.plotly_chart(fig_score)
+
+    # Metric 3: Top posts for Z30 by upvotes
+    st.subheader("🔥 Top Nikon Posts by Upvotes")
+    df["upvotes"] = pd.to_numeric(df["upvotes"], errors="coerce")
+    nikon_posts = df[df["camera"].str.lower() == "nikon"].sort_values("upvotes", ascending=False).head(20)
+    st.dataframe(nikon_posts[["upvotes", "sentiment_label", "title", "selftext", "created_date", "num_comments", "post_link"]])
+
+    # Metric 4: Top posts for Z30 by number of comments
+    st.subheader("💬 Top Nikon Posts by Number of Comments")
+    df["num_comments"] = pd.to_numeric(df["num_comments"], errors="coerce")
+    nikon_discussion_posts = df[df["camera"].str.lower() == "nikon"].sort_values("num_comments", ascending=False).head(20)
+    st.dataframe(nikon_discussion_posts[["num_comments", "upvotes", "sentiment_label", "title", "selftext", "created_date", "post_link"]])
+
+    # Metric 5: User Activity Heatmap (Post Count Over Time)
+    st.subheader("📈 User Activity Heatmap (Post Count Over Time)")
+    nikon_df = df[df["camera"].astype(str).str.strip().str.lower() == "nikon"].copy()
+    nikon_df = nikon_df[nikon_df["created_date"].notna()]
+    nikon_df["period"] = nikon_df["created_date"].dt.to_period("Q")
+    min_period = pd.Period("2022Q3")
+    nikon_df = nikon_df[nikon_df["period"] >= min_period]
+    post_count = nikon_df.groupby("period").size().rename("Post Count").reset_index()
+    if not post_count.empty:
+        all_periods = pd.period_range(start="2022Q3", end=nikon_df["period"].max(), freq="Q")
+        post_count = post_count.set_index("period").reindex(all_periods, fill_value=0).reset_index()
+        post_count.rename(columns={"index": "period"}, inplace=True)
+    heatmap_pivot = post_count.pivot_table(columns="period", values="Post Count", aggfunc="sum").fillna(0)
+    heatmap_pivot.columns = heatmap_pivot.columns.astype(str)
+    fig, ax = plt.subplots(figsize=(max(4, len(heatmap_pivot.columns) * 0.8), 2))
+    sns.heatmap(
+        heatmap_pivot,
+        annot=True,
+        fmt=".0f",
+        cmap=sns.color_palette(["#fffbe6", "#ffe066", "#ffd700"], as_cmap=True),
+        cbar_kws={'label': 'Number of Posts'},
+        ax=ax
+    )
+    ax.set_xlabel("Post Created Date")
+    ax.set_title("User Activity Heatmap (Nikon Post Count Over Time)")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     st.pyplot(fig)
 
-    st.markdown('---')
-    st.subheader('3. 📝 Auto-generated Analysis Report')
-    stat_str = ', '.join([f'{k}: {v}' for k, v in stat.items()])
-    with st.spinner('Generating report...'):
-        report = generate_report(stat_str)
-    st.success(report)
+# 5. Competitor Analysis Page
+def load_data():
+    """
+    Load and preprocess the main Reddit posts dataset.
+    """
+    df = pd.read_csv("cleaned_all_reddit_posts.csv")
+    if "created_utc" in df.columns:
+        df["created_date"] = pd.to_datetime(df["created_utc"], unit="s", errors="coerce")
+    else:
+        df["created_date"] = pd.to_datetime(df["created_date"], errors="coerce")
+    df["text"] = df["title"].fillna('') + " " + df["selftext"].fillna('')
+    df["text"] = df["text"].fillna("")
+    if "sentiment_label" not in df.columns or df["sentiment_label"].isnull().all() or (df["sentiment_label"] == "").all():
+        df = perform_sentiment_analysis(df, text_column="text")
+    return df
 
-    st.markdown('---')
-    st.subheader('4. ⬇️ Download Results')
-    csv = df_result.to_csv(index=False).encode('utf-8')
-    st.download_button('Download Results CSV', csv, 'sentiment_results.csv', 'text/csv')
-else:
-    st.info('Please upload a CSV file or manually input Weibo texts.')
+def show_competitor_analysis():
+    """
+    Display the competitor analysis page, including filters, tables, heatmaps, and wordclouds.
+    """
+    df = load_data()
+    st.markdown(
+        """
+        <div style="background: #fffbe6; padding: 20px 24px; border-radius: 12px; margin-bottom: 24px; border: 1px solid transparent;">
+            <div style="font-size: 1.08rem; color: #222; margin-bottom: 10px;">
+                In the dynamic world of photography, three cameras dominate novice creators’ radar:
+            </div>
+            <div style="text-align:center; font-size:1.18rem; font-weight:bold; color:#222; margin-bottom: 10px;">
+                <b>📷 Nikon Z30, Sony ZVE10, and Canon R50</b>
+            </div>
+            <div style="font-size: 1.08rem; color: #222; margin-bottom: 10px;">
+                As the "big three" brands’ entry-level anchors, the Sony ZVE10 and Canon R50 are more than rivals to Nikon—they are pivotal benchmarks shaping market expectations as gateways to visual storytelling for beginners.
+            </div>
+            <div style="font-size: 1.08rem; color: #222;">
+                Stay tuned to uncover why these models demand our focus in crafting the Z30’s competitive edge! 💡
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # Show Parameter Comparison table
+    try:
+        param_df = pd.read_csv("Parameter Comparison.csv")
+        st.subheader("📋 Camera Parameter Comparison")
+        st.markdown(
+            """
+            <style>
+            .centered-table {margin-left:auto; margin-right:auto;}
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+        st.dataframe(param_df, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Unable to load Parameter Comparison table: {e}")
+
+    left_col, right_col = st.columns([1, 3])
+
+    # Filters for competitor-related posts
+    with left_col:
+        st.header("🔍 Filters")
+        camera_options = ["nikon", "sony", "canon"]
+        selected_cameras = st.multiselect(
+            "Select Cameras",
+            camera_options,
+            default=camera_options
+        )
+        start_date = st.date_input("Start Date", df["created_date"].min().date())
+        end_date = st.date_input("End Date", df["created_date"].max().date())
+        filtered = df[
+            (df["camera"].isin(selected_cameras)) &
+            (df["created_date"].dt.date >= start_date) &
+            (df["created_date"].dt.date <= end_date)
+        ].copy()
+    
+    # Top posts by upvotes and sentiment heatmap
+    with right_col:
+        st.subheader("🔥 Top Posts by Upvotes (Filtered)")
+        display_cols = [col for col in ["camera", "upvotes", "sentiment_label", "title", "selftext", "created_date", "num_comments"] if col in filtered.columns]
+        top_posts = filtered.sort_values("upvotes", ascending=False).head(10)
+        st.dataframe(top_posts[display_cols])
+
+        st.subheader("📌 Sentiment Heatmap by Camera Model")
+        if "sentiment_label" in filtered.columns:
+            sentiment_order = ["Negative", "Neutral", "Positive"]
+            heat_df = filtered.pivot_table(
+                index="camera",
+                columns="sentiment_label",
+                aggfunc="size",
+                fill_value=0
+            )
+            heat_df = heat_df.reindex(columns=sentiment_order, fill_value=0)
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.heatmap(heat_df, annot=True, fmt="d", cmap="YlGnBu", ax=ax)
+            ax.set_xlabel("Sentiment Label")
+            ax.set_ylabel("Camera Model")
+            st.pyplot(fig)
+        else:
+            st.info("No sentiment_label column available for heatmap.")
+
+        # Feature wordclouds
+        st.subheader("🧠 Feature WordClouds")
+        feature_keywords = {
+            "Image Quality": ["image", "quality", "photo", "sharp", "noise", "dynamic range"],
+            "Autofocus": ["autofocus", "focus", "tracking", "eye af", "subject detect"],
+            "Video": ["video", "recording", "4k", "fps", "vlog"],
+            "Portability": ["light", "compact", "small", "carry", "travel"],
+            "Buttons": ["button", "layout", "control", "touch", "menu"],
+            "Battery": ["battery", "life", "charge", "duration", "power"]
+        }
+
+        def generate_wordcloud(text):
+            wc = WordCloud(width=800, height=400, background_color="white").generate(text)
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.imshow(wc, interpolation='bilinear')
+            ax.axis("off")
+            return fig
+
+        for feature, keywords in feature_keywords.items():
+            relevant_texts = filtered["text"].apply(
+                lambda x: any(kw in x.lower() for kw in keywords) if isinstance(x, str) else False
+            )
+            combined_text = " ".join(filtered[relevant_texts]["text"].dropna().tolist())
+            if combined_text.strip():
+                st.markdown(f"**{feature}**")
+                fig_wc = generate_wordcloud(combined_text)
+                st.pyplot(fig_wc)
+
+# 6. main function
+if __name__ == "__main__":
+    st.set_page_config(page_title="Nikon Z30 Insight Hub", layout="wide")
+    page = sidebar()
+    if page == "Nikon Z30 Insights":
+        show_nikon_z30()
+    elif page == "Competitor Analysis":
+        show_competitor_analysis()
