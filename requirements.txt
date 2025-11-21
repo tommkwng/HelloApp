@@ -1,6 +1,8 @@
-streamlit
-torch
-nest_asyncio
-huggingface_hub
-accelerate
+streamlit==1.22.0
+pandas
+plotly
+beautifulsoup4
+requests
 transformers
+torch
+matplotlib
