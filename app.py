@@ -1,239 +1,116 @@
-import gradio as gr
-import torch
-import csv, os, datetime
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    AutoModelForSeq2SeqLM,
+# app.py
+import streamlit as st
+from transformers import pipeline
+import time
+
+st.set_page_config(
+    page_title="Cosmetic Review Analyst",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
+st.session_state.disable_watchdog = True
 
-# ─── Custom CSS ────────────────────────────────────────────────────────────────
-CSS = """
-#root {
-    max-width: 900px;
-    margin: 40px auto;
-    padding: 20px;
-    background: var(--block-background);
-    border-radius: 8px;
-    box-shadow: var(--block-container-elevation-2);
-}
-#sidebar {
-    background: var(--block-container-background);
-    padding: 16px;
-    border-radius: 8px;
-}
-#primary-btn { background-color: #2a9d8f !important; color: white !important; }
-.gradio-txt, .gradio-btn { margin-bottom: 12px !important; }
-"""
+def load_css():
+    st.markdown("""
+    <style>
+        .reportview-container .main .block-container{
+            max-width: 1200px;
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        .stTextInput textarea {
+            border-radius: 15px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .stProgress > div > div > div > div {
+            background-image: linear-gradient(to right, #ff6b6b, #ff8e53);
+        }
+        .st-bw {
+            background-color: #ffffff;
+            border-radius: 10px;
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
-# ─── Model Loading ──────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
 def load_models():
-    clf_tok   = AutoTokenizer.from_pretrained("prachijhaveri/roberta-fake-news-detector")
-    clf_model = AutoModelForSequenceClassification.from_pretrained(
-        "prachijhaveri/roberta-fake-news-detector"
+    summarizer = pipeline(
+        "summarization",
+        model="Falconsai/text_summarization",
+        max_length=200,
+        temperature=0.7
     )
-    gen_tok   = AutoTokenizer.from_pretrained("google/flan-t5-small")
-    gen_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
-    if torch.cuda.is_available():
-        clf_model.cuda()
-        gen_model.cuda()
-    return clf_tok, clf_model, gen_tok, gen_model
-
-# load once
-clf_tok, clf_model, gen_tok, gen_model = load_models()
-
-
-# ─── Confidence Bar Helper ─────────────────────────────────────────────────────
-def confidence_bar(is_fake: bool, pct: float) -> str:
-    color = "#e63946" if is_fake else "#2a9d8f"
-    return (
-        "<div style='width:100%;background:var(--block-border);border-radius:4px;"
-        "margin:6px 0;'>"
-        f"<div style='width:{pct:.1f}%;background:{color};padding:4px 0;"
-        "border-radius:4px;text-align:center;color:white;font-weight:bold;"
-        "font-size:14px;'>"
-        f"{pct:.1f}% confidence</div></div>"
+    
+    classifier = pipeline(
+        "text-classification",
+        model="clb5114/EPR_emoclass_TinyBERT",
+        return_all_scores=True
     )
-
-
-# ─── Core Inference Routine ────────────────────────────────────────────────────
-def analyze(
-    headline: str,
-    date: str,
-    subject: str,
-    speaker: str,
-    speaker_descr: str,
-    state_info: str,
-    context_src: str,
-    full_article: str,
-    user_justification: str,
-    clf_tok,
-    clf_model,
-    gen_tok,
-    gen_model,
-):
-    text = full_article.strip()
-    if not text:
-        return "<p style='color:#e63946'>❗ Please paste the full article text.</p>", "", "", ""
-    snippet = text[:2000]
-
-    # 1) Build metadata blob
-    metadata_blob = (
-        f"Headline: {headline}\n"
-        f"Date: {date}\n"
-        f"Subject: {subject}\n"
-        f"Speaker: {speaker}\n"
-        f"Speaker description: {speaker_descr}\n"
-        f"State: {state_info}\n"
-        f"Context: {context_src}"
-    )
-
-    # 2) Justification (echo or generate)
-    if user_justification.strip():
-        just_text = user_justification.strip()
-    else:
-        just_prompt = (
-            f"{metadata_blob}\n\nArticle (snippet):\n{snippet}\n\n"
-            "Briefly justify why this article might be fake or real."
-        )
-        j_tok = gen_tok(
-            just_prompt,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=512,   # summariser can also use 512 tokens
-        )
-        if torch.cuda.is_available():
-            j_tok = {k:v.cuda() for k,v in j_tok.items()}
-        with torch.no_grad():
-            j_ids = gen_model.generate(
-                **j_tok,
-                max_new_tokens=60,
-                num_beams=1,
-                do_sample=False,
-                early_stopping=True,
-            )
-        just_text = gen_tok.decode(j_ids[0], skip_special_tokens=True).strip()
-
-    # 3) Classification on enriched text, total max 512 tokens
-    enriched_blob = metadata_blob + f"\nJustification: {just_text}"
-    inp = clf_tok(
-        enriched_blob,
-        snippet,
-        return_tensors="pt",
-        truncation="only_second",   # keep enriched_blob intact
-        padding="max_length",
-        max_length=512,             # MUST be ≤ 512 for RoBERTa
-    )
-    if torch.cuda.is_available():
-        inp = {k:v.cuda() for k,v in inp.items()}
-    with torch.no_grad():
-        logits = clf_model(**inp).logits
-    probs   = torch.softmax(logits, dim=-1)[0].cpu().numpy()
-    is_fake = bool(probs.argmax())
-    label   = "Fake" if is_fake else "Real"
-    conf    = probs.max()*100
-    verdict_html = (
-        f"<h3 style='margin:4px 0;color:{'#e63946' if is_fake else '#2a9d8f'}'>{label}</h3>"
-        + confidence_bar(is_fake, conf)
-    )
-
-    # 4) Summarisation on full text (unchanged)
-    sum_prompt = (
-        f"The article is classified as '{label}' ({conf:.1f}% confidence). "
-        "Summarize it in 2–3 concise sentences:\n\n" + text
-    )
-    sum_tok = gen_tok(
-        sum_prompt,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=2048,
-    )
-    if torch.cuda.is_available():
-        sum_tok = {k:v.cuda() for k,v in sum_tok.items()}
-    with torch.no_grad():
-        sum_ids = gen_model.generate(
-            **sum_tok,
-            max_new_tokens=80,
-            num_beams=1,
-            do_sample=False,
-            early_stopping=True,
-        )
-    summary_html = f"<p style='margin:4px 0;font-size:14px;'>{gen_tok.decode(sum_ids[0], skip_special_tokens=True).strip()}</p>"
-
-    # 5) Justification output + feedback log
-    just_html = f"<p style='margin:4px 0;font-size:14px;'><strong>Justification:</strong> {just_text}</p>"
-    cls_input = enriched_blob + "\n\nArticle:\n" + snippet
-    return verdict_html, summary_html, just_html, cls_input
-
-
-# ─── Feedback Logger ────────────────────────────────────────────────────────────
-def log_feedback(cls_input: str, feedback: str):
-    ts = datetime.datetime.utcnow().isoformat()
-    fname = "feedback_log.csv"
-    write_header = not os.path.exists(fname)
-    with open(fname, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(["timestamp", "classifier_input", "feedback"])
-        w.writerow([ts, cls_input.replace("\n", " | "), feedback])
-    return "<p style='color:#2a9d8f'>Thank you for your feedback!</p>"
-
-
-# ─── UI ─────────────────────────────────────────────────────────────────────────
-def build_ui():
-    with gr.Blocks(css=CSS) as demo:
-        gr.Markdown("## 📰 Fake-News Detector & Summariser")
-
-        with gr.Row():
-            with gr.Column(scale=1, elem_id="sidebar"):
-                gr.Markdown("### Metadata")
-                headline_tb      = gr.Textbox(label="Article Headline *", lines=2)
-                date_tb          = gr.Textbox(label="Date (YYYY-MM-DD)")
-                subject_tb       = gr.Textbox(label="Subject")
-                state_tb         = gr.Textbox(label="State info")
-                speaker_tb       = gr.Textbox(label="Speaker/Writer")
-                speaker_desc_tb  = gr.Textbox(label="Speaker description")
-                context_tb       = gr.Textbox(label="Context Source", lines=2)
-                justification_tb = gr.Textbox(label="Your Justification (optional)", lines=3)
-
-            with gr.Column(scale=2):
-                full_article_tb    = gr.Textbox(label="Full Article *", lines=20)
-                analyze_btn        = gr.Button("Analyze & Summarise", variant="primary", elem_id="primary-btn")
-                verdict_html       = gr.HTML("<p>Waiting for analysis…</p>")
-                summary_html       = gr.HTML("<p>Waiting for summary…</p>")
-                justification_html = gr.HTML("<p>Waiting for justification…</p>")
-                record_box         = gr.Textbox(visible=False)
-
-        analyze_btn.click(
-            fn=lambda *args: analyze(*args, clf_tok, clf_model, gen_tok, gen_model),
-            inputs=[
-                headline_tb, date_tb, subject_tb, speaker_tb,
-                speaker_desc_tb, state_tb, context_tb,
-                full_article_tb, justification_tb
-            ],
-            outputs=[verdict_html, summary_html, justification_html, record_box],
-            show_progress=True,
-        )
-
-        feedback_radio = gr.Radio(choices=["Yes", "No"], label="Was the verdict correct?")
-        feedback_btn   = gr.Button("Submit Feedback")
-        feedback_msg   = gr.HTML()
-
-        feedback_btn.click(
-            fn=log_feedback,
-            inputs=[record_box, feedback_radio],
-            outputs=[feedback_msg],
-        )
-
-    return demo
-
+    return summarizer, classifier
 
 def main():
-    ui = build_ui()
-    ui.launch()
-
+    load_css()
+    st.title("💄 Cosmetic Review AI Analyst")
+    st.warning("⚠️ Please keep reviews under 200 words for optimal analysis")
+    
+    user_input = st.text_area(
+        "Input cosmetic product review (Chinese/English supported)", 
+        height=200,
+        placeholder="Example: This serum transformed my skin in just 3 days...",
+        help="Maximum 200 characters recommended"
+    )
+    
+    if st.button("Start Analysis", use_container_width=True):
+        if not user_input.strip():
+            st.error("⚠️ Please input valid review content")
+            return
+            
+        with st.spinner('🔍 Analyzing...'):
+            try:
+                summarizer, classifier = load_models()
+                
+                with st.expander("Original Review", expanded=True):
+                    st.write(user_input)
+                
+                # Text summarization
+                summary = summarizer(user_input, max_length=200)[0]['summary_text']
+                with st.container():
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        st.subheader("📝 Summary")
+                    with col2:
+                        st.markdown(f"```\n{summary}\n```")
+                
+                # Sentiment analysis
+                results = classifier(summary)
+                positive_score = results[0][1]['score']
+                label = "Positive 👍" if positive_score > 0.5 else "Negative 👎"
+                
+                with st.container():
+                    st.subheader("📊 Sentiment Analysis")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Verdict", label)
+                        st.write(f"Confidence: {positive_score:.2%}")
+                    with col2:
+                        progress_color = "#4CAF50" if label=="Positive 👍" else "#FF5252"
+                        st.markdown(f"""
+                        <div style="
+                            background: {progress_color}10;
+                            border-radius: 10px;
+                            padding: 15px;
+                        ">
+                            <div style="font-size: 14px; color: {progress_color}; margin-bottom: 8px;">Intensity</div>
+                            <div style="height: 8px; background: #eee; border-radius: 4px;">
+                                <div style="width: {positive_score*100}%; height: 100%; background: {progress_color}; border-radius: 4px;"></div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+            except Exception as e:
+                st.error(f"Analysis failed: {str(e)}")
 
 if __name__ == "__main__":
     main()
