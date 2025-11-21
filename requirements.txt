@@ -1,3 +1,6 @@
 streamlit
-transformers
 torch
+nest_asyncio
+huggingface_hub
+accelerate
+transformers
